@@ -6,7 +6,7 @@ Error handling on Juniper so if the commit fails, a rollback 0 is performed to r
 Summary report afterwards shows successes, failures, and other information for remediation.
 
 
-Looking at Phase 5c in the file:
+```Looking at Phase 5c in the file:
 ======================================================================
 CHANGE WINDOW SUMMARY
 ======================================================================
