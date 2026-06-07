@@ -11,7 +11,7 @@ Summary report afterwards shows successes, failures, and other information for r
 CHANGE WINDOW SUMMARY
 ======================================================================
 Executed    : 2026-06-06 14:32:01
-Vendor      : cisco
+Vendor      : juniper
 Commands    : ./commands.txt
 Targets     : ./targets.txt
 
