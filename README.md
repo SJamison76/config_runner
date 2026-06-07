@@ -1,7 +1,7 @@
 # config_runner
 Ansible Playbook to deploy configurations to different network devices.
 
-Error handling on Juniper so if the commit fails, a rollback 0 is performed to remove the candidate config from becoming stale. Works on any network device since we are sending raw commands directly in the commands.txt file.
+Error handling on Juniper so if the commit fails, a rollback 0 is performed to remove the candidate config from becoming stale. Works on any network device since we are sending raw commands directly in the commands.txt file. The first login fingerprints the device with a show version, and if it passes for what you have stated in the commands.txt file it will execute. if it doesnt pass, then it fails as seen below.
 
 Summary report afterwards shows successes, failures, and other information for remediation.
 
