@@ -1,0 +1,11 @@
+ANSIBLE_CONFIG=./ansible.cfg ansible-playbook config_runner.yml
+
+
+# Dry-run syntax check (won't SSH anywhere)
+ANSIBLE_CONFIG=./ansible.cfg ansible-playbook config_runner.yml --syntax-check
+
+# See verbose output in terminal while it runs
+ANSIBLE_CONFIG=./ansible.cfg ansible-playbook config_runner.yml -v
+
+# Override vars without editing the file (handy for different runs)
+ANSIBLE_CONFIG=./ansible.cfg ansible-playbook config_runner.yml -e "target_vendor=cisco commands_file=./cisco_commands.txt targets_file=./cisco_targets.txt"

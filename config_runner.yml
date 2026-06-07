@@ -1,0 +1,298 @@
+---
+- name: Multi-Vendor Generic Command Runner & Logger
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # ====== CONFIGURE YOUR DETAILS HERE ======
+    targets_file: "./targets.txt"
+    commands_file: "./commands.txt"
+    output_dir: "./logs"
+    ssh_timeout: 10
+    ssh_cmd_wait: 30
+
+  vars_prompt:
+    - name: ssh_user
+      prompt: "SSH username"
+      private: no
+
+    - name: ssh_password
+      prompt: "SSH password"
+      private: yes
+
+    - name: target_vendor
+      prompt: "Target vendor (cisco/juniper/brocade)"
+      private: no
+
+  tasks:
+    # ------------------------------------------------------------------
+    # PHASE 0: Pre-flight checks & Vendor Validation
+    # ------------------------------------------------------------------
+    - name: "PHASE 0a: Verify sshpass is installed"
+      command: which sshpass
+      register: sshpass_check
+      failed_when: sshpass_check.rc != 0
+      changed_when: false
+
+    - name: "PHASE 0b: Read commands file for safety check"
+      set_fact:
+        pre_validate_commands: "{{ lookup('file', commands_file) }}"
+
+    - name: "PHASE 0c: Enforce Vendor Command Match"
+      fail:
+        msg: >-
+          CRITICAL ERROR: Command payload mismatch!
+          You specified target_vendor='{{ target_vendor }}', but your command file contains
+          syntax that does not match this hardware family. Execution halted for network safety.
+      when: >
+        (target_vendor == 'juniper' and ('configure terminal' in pre_validate_commands or 'show ip interface brief' in pre_validate_commands)) or
+        (target_vendor == 'cisco' and ('set system' in pre_validate_commands or 'commit' in pre_validate_commands)) or
+        (target_vendor == 'brocade' and ('write memory' in pre_validate_commands and 'configure terminal' not in pre_validate_commands))
+
+    # ------------------------------------------------------------------
+    # PHASE 1: Initialize environment and load input files
+    # ------------------------------------------------------------------
+    - name: "PHASE 1a: Pin report timestamp once for the entire run"
+      # Sampled exactly once here so Phase 5b and 5c always reference
+      # the identical string — no second-boundary race condition.
+      set_fact:
+        report_timestamp: "{{ now(fmt='%Y%m%d_%H%M%S') }}"
+        report_timestamp_human: "{{ now(fmt='%Y-%m-%d %H:%M:%S') }}"
+
+    - name: "PHASE 1b: Ensure output directory exists"
+      file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: "PHASE 1c: Read targets file"
+      set_fact:
+        device_list: >-
+          {{ lookup('file', targets_file).splitlines()
+             | reject('match', '^\s*#')
+             | reject('equalto', '')
+             | list
+             | unique }}
+
+    - name: "PHASE 1d: Read commands file"
+      set_fact:
+        raw_commands: "{{ pre_validate_commands }}"
+
+    - name: "PHASE 1e: Write commands to a temp script on disk"
+      # ansible_pid isolates this file per-run so concurrent playbook
+      # executions (e.g. two regions at once) never clobber each other.
+      copy:
+        dest: "/tmp/ansible_cmd_payload_{{ ansible_pid }}.txt"
+        content: "{{ raw_commands }}"
+        mode: '0600'
+
+    # ------------------------------------------------------------------
+    # PHASE 2: Execute payload on each target
+    # ------------------------------------------------------------------
+    - name: "PHASE 2: SSH into device and push commands"
+      shell: |
+        set -e
+        LOG_TMP=$(mktemp /tmp/ansible_log_XXXXXX)
+
+        # Use a trap so the temp file is always removed, even on error/kill
+        trap 'rm -f "$LOG_TMP"' EXIT
+
+        (
+          sleep 1
+          # Vendor-specific initialization line
+          {% if target_vendor == 'cisco' %}
+          echo "terminal length 0" 2>/dev/null || true
+          {% elif target_vendor == 'juniper' %}
+          echo "cli"               2>/dev/null || true
+          {% endif %}
+          sleep 1
+          cat "/tmp/ansible_cmd_payload_{{ ansible_pid }}.txt"
+          sleep {{ ssh_cmd_wait }}
+          echo "exit"
+        ) | sshpass -p '{{ ssh_password }}' ssh -tt \
+              -o PreferredAuthentications=password \
+              -o PubkeyAuthentication=no \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout={{ ssh_timeout }} \
+              {{ ssh_user }}@{{ target }} > "$LOG_TMP" 2>&1 || true
+
+        # --- Juniper-specific commit-failure detection & auto-rollback ---
+        {% if target_vendor == 'juniper' %}
+        if grep -qiE "error:.*commit|commit.*failed|check-out failed" "$LOG_TMP"; then
+          (
+            sleep 1
+            echo "cli"       2>/dev/null || true
+            sleep 1
+            echo "configure"
+            sleep 1
+            echo "rollback 0"
+            sleep 1
+            echo "exit"
+            sleep 1
+            echo "exit"
+          ) | sshpass -p '{{ ssh_password }}' ssh -tt \
+                -o PreferredAuthentications=password \
+                -o PubkeyAuthentication=no \
+                -o StrictHostKeyChecking=no \
+                -o ConnectTimeout={{ ssh_timeout }} \
+                {{ ssh_user }}@{{ target }} > /dev/null 2>&1 || true
+
+          echo -e "\n\n!!! AUTOMATED AUDIT ALERT: COMMIT FAILED — ROLLBACK 0 EXECUTED !!!" >> "$LOG_TMP"
+        fi
+        {% endif %}
+
+        # Print log content so Ansible captures it in stdout
+        cat "$LOG_TMP"
+      args:
+        executable: /bin/bash
+      register: device_execution
+      failed_when: false
+      changed_when: false
+      loop: "{{ device_list }}"
+      loop_control:
+        loop_var: target
+        label: "{{ target }}"
+
+    # ------------------------------------------------------------------
+    # PHASE 3: Write per-device log files
+    # ------------------------------------------------------------------
+    - name: "PHASE 3: Log output for each device"
+      copy:
+        dest: "{{ output_dir }}/{{ item.target | default(item.ansible_loop_var | default('unknown')) }}_verification.log"
+        content: |
+          ======================================================================
+          COMMAND EXECUTION RECORD
+          Target Device : {{ item.target | default('UNKNOWN — see loop index') }}
+          Execution Time: {{ report_timestamp_human }}
+          Vendor Profile: {{ target_vendor }}
+          ======================================================================
+
+          {{ item.stdout | default('NO OUTPUT GENERATED OR DEVICE UNREACHABLE') }}
+        mode: '0644'
+      loop: "{{ device_execution.results }}"
+      loop_control:
+        label: "{{ item.target | default('unknown') }}"
+
+    # ------------------------------------------------------------------
+    # PHASE 4: Cleanup temp payload file
+    # ------------------------------------------------------------------
+    - name: "PHASE 4: Remove temp command payload"
+      file:
+        path: "/tmp/ansible_cmd_payload_{{ ansible_pid }}.txt"
+        state: absent
+
+    # ------------------------------------------------------------------
+    # PHASE 5: Generate change window summary report
+    # ------------------------------------------------------------------
+    - name: "PHASE 5a: Build raw rollback and unreachable candidate lists"
+      set_fact:
+        # ROLLBACK (raw): commit failed and rollback was executed.
+        # Calculated first so unreachable can be purged of any overlap.
+        _raw_rollback: >-
+          {{ device_execution.results
+             | selectattr('stdout', 'defined')
+             | selectattr('stdout', 'search', 'AUTOMATED AUDIT ALERT')
+             | map(attribute='target')
+             | list
+             | unique }}
+
+        # UNREACHABLE (raw): stdout contains known SSH/sshpass error fingerprints,
+        # or is genuinely empty. Catches timeouts, refused connections,
+        # bad credentials, and host-unreachable errors — all of which
+        # produce error text in stdout via the 2>&1 redirect in Phase 2.
+        _raw_unreachable: >-
+          {{ (device_execution.results
+             | selectattr('stdout', 'defined')
+             | selectattr('stdout', 'search',
+                 '(?i)(connect to host|connection timed out|connection refused|'
+                 'no route to host|permission denied|host key verification|'
+                 'network is unreachable|ssh_exchange_identification|'
+                 'Operation timed out)')
+             | map(attribute='target')
+             | list
+             + device_execution.results
+             | selectattr('stdout', 'defined')
+             | selectattr('stdout', 'equalto', '')
+             | map(attribute='target')
+             | list
+             + device_execution.results
+             | rejectattr('stdout', 'defined')
+             | map(attribute='target')
+             | list)
+             | unique }}
+
+    - name: "PHASE 5b: Apply strict set subtraction — mutually exclusive buckets"
+      set_fact:
+        # ROLLBACK wins priority: a device that triggered both an AUDIT ALERT
+        # and a connection error lands here only, not in unreachable.
+        summary_rollback: "{{ _raw_rollback }}"
+
+        # UNREACHABLE: strip out anything already claimed by rollback so no
+        # device is ever counted in both buckets simultaneously.
+        summary_unreachable: "{{ _raw_unreachable | difference(_raw_rollback) }}"
+
+        # SUCCESS: whatever remains after both failure buckets are removed.
+        # Reachable + Unreachable + Rollback will always equal Total Targets.
+        summary_success: >-
+          {{ device_list
+             | difference(_raw_rollback)
+             | difference(_raw_unreachable) }}
+
+    - name: "PHASE 5c: Write summary report"
+      copy:
+        # report_timestamp pinned in Phase 1a — identical string used in 5d
+        dest: "{{ output_dir }}/SUMMARY_{{ report_timestamp }}.txt"
+        content: |
+          ======================================================================
+          CHANGE WINDOW SUMMARY
+          ======================================================================
+          Executed    : {{ report_timestamp_human }}
+          Vendor      : {{ target_vendor }}
+          Commands    : {{ commands_file }}
+          Targets     : {{ targets_file }}
+
+          TOTALS
+          ------
+          Total Targets   : {{ device_list | length }}
+          Reachable       : {{ (summary_success | length) + (summary_rollback | length) }}
+          Unreachable     : {{ summary_unreachable | length }}
+          Commit Failures : {{ summary_rollback | length }}{% if summary_rollback | length > 0 %}  ← rollback executed on all{% endif %}
+
+          Clean Success   : {{ summary_success | length }}
+
+          {% if summary_unreachable | length > 0 %}
+          ======================================================================
+          UNREACHABLE DEVICES (manual follow-up required)
+          ======================================================================
+          {% for ip in summary_unreachable %}
+            {{ ip }}
+          {% endfor %}
+
+          {% endif %}
+          {% if summary_rollback | length > 0 %}
+          ======================================================================
+          COMMIT FAILURES — ROLLBACK 0 EXECUTED (verify manually)
+          ======================================================================
+          {% for ip in summary_rollback %}
+            {{ ip }}
+          {% endfor %}
+
+          {% endif %}
+          ======================================================================
+          CLEAN SUCCESS
+          ======================================================================
+          {% for ip in summary_success %}
+            {{ ip }}
+          {% endfor %}
+        mode: '0644'
+
+    - name: "PHASE 5d: Print summary to terminal"
+      debug:
+        msg: |
+          ======================================================================
+          RUN COMPLETE — {{ device_list | length }} targets processed
+          Clean Success   : {{ summary_success | length }}
+          Unreachable     : {{ summary_unreachable | length }}
+          Commit Failures : {{ summary_rollback | length }}
+          Full report written to: {{ output_dir }}/SUMMARY_{{ report_timestamp }}.txt
+          ======================================================================

@@ -1,0 +1,6 @@
+#enter commands here exactly as you would on the device. Juniper example
+
+edit
+set system ntp server 1.1.1.1 version 4 prefer
+show | compare
+commit and quit
