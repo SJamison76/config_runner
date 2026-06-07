@@ -11,28 +11,38 @@ Summary report afterwards shows successes, failures, and other information for r
 CHANGE WINDOW SUMMARY
 ======================================================================
 Executed    : 2026-06-06 14:32:01
-Vendor      : juniper
+Vendor      : cisco
 Commands    : ./commands.txt
 Targets     : ./targets.txt
 
 TOTALS
 ------
-Total Targets   : 10
-Reachable       : 8
-Unreachable     : 2
+Total Targets   : 8
+Vendor Matched  : 6
+Vendor Mismatch : 2  ← skipped, no commands sent
+
+Reachable       : 5
+Unreachable     : 1
 Commit Failures : 0
 
-Clean Success   : 8
+Clean Success   : 5
+
+======================================================================
+VENDOR MISMATCH — SKIPPED (manual verification required)
+======================================================================
+  10.2.1.1
+  10.2.1.2
 
 ======================================================================
 UNREACHABLE DEVICES (manual follow-up required)
 ======================================================================
   10.1.1.1
-  10.1.1.2
 
 ======================================================================
 CLEAN SUCCESS
 ======================================================================
-  10.1.1.3
-  10.1.1.4
-  ...
+  10.1.11.2
+  10.1.11.3
+  10.1.11.4
+  10.1.11.5
+  10.1.11.6
