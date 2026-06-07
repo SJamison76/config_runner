@@ -1,4 +1,4 @@
-## examples
+## examples dont run all three, just use one for targeted deployment.
 
 ## vendor: cisco
 terminal length 0
