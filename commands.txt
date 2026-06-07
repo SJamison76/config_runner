@@ -1,6 +1,23 @@
-#enter commands here exactly as you would on the device. Juniper example
+## examples
 
+## vendor: cisco
+terminal length 0
+configure terminal
+interface loopback0
+description Managed by Ansible
+end
+write memory
+
+## vendor: brocade
+terminal length 0
+configure terminal
+interface loopback 1
+port-name Managed by Ansible
+end
+write memory
+
+## vendor: juniper
 edit
-set system ntp server 1.1.1.1 version 4 prefer
-show | compare
-commit and quit
+set interfaces lo0 description Managed by Ansible
+commit
+exit
