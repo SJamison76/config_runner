@@ -1,4 +1,6 @@
 # config_runner
+*****STILL A WORK IN PROGRESS******
+
 Ansible Playbook to deploy configurations to different network devices. I dont have arista or other network devices. they could be easily added, if I was given specific outputs that I need to see.
 
 Error handling on Juniper so if the commit fails, a rollback 0 is performed to remove the candidate config from becoming stale. Raw commands are directly sent in the commands.txt file based off the vendor. You must type exactly as you would if you were in the cli. The first login fingerprints the device with a show version, and if it passes for what you have stated in the commands.txt file it will execute. if it doesnt pass, then it fails as seen below.
