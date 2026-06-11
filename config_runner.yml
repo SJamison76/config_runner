@@ -1,436 +1,213 @@
 ---
-- name: Multi-Vendor Generic Command Runner & Logger
+- name: "PHASE 1: Pre-flight & Target Ingestion"
   hosts: localhost
   gather_facts: false
-
+  strategy: linear
   vars:
-    # ====== CONFIGURE YOUR DETAILS HERE ======
     targets_file: "./targets.txt"
     commands_file: "./commands.txt"
     output_dir: "./logs"
-    ssh_timeout: 10
-    ssh_cmd_wait: 30
 
   vars_prompt:
     - name: ssh_user
       prompt: "SSH username"
       private: no
-
     - name: ssh_password
       prompt: "SSH password"
       private: yes
 
   tasks:
-    # ------------------------------------------------------------------
-    # PHASE 0: Pre-flight checks
-    # ------------------------------------------------------------------
-    - name: "PHASE 0a: Verify sshpass is installed"
+    - name: "Verify sshpass is installed"
       command: which sshpass
       register: sshpass_check
       failed_when: sshpass_check.rc != 0
       changed_when: false
 
-    - name: "PHASE 0b: Read commands file"
-      set_fact:
-        pre_validate_commands: "{{ lookup('file', commands_file) }}"
-
-    - name: "PHASE 0c: Extract declared vendor from commands.txt header"
-      # commands.txt must contain a header line like:  ## vendor: cisco
-      # Supported values: cisco, brocade, juniper
-      set_fact:
-        declared_vendor: >-
-          {{
-            pre_validate_commands.splitlines()
-            | select('match', '^\s*##\s*vendor\s*:', ignorecase=True)
-            | list | first | default('')
-            | regex_replace('^\s*##\s*vendor\s*:\s*', '')
-            | trim | lower
-          }}
-
-    - name: "PHASE 0d: Fail if no vendor tag found in commands.txt"
-      fail:
-        msg: >-
-          CRITICAL ERROR: No vendor tag found in {{ commands_file }}.
-          Add a header line as the first line of your commands file:
-            ## vendor: cisco
-            ## vendor: brocade
-            ## vendor: juniper
-      when: declared_vendor == ''
-
-    - name: "PHASE 0e: Fail if vendor tag is not a supported value"
-      fail:
-        msg: >-
-          CRITICAL ERROR: Unsupported vendor '{{ declared_vendor }}' in {{ commands_file }}.
-          Supported values are: cisco, brocade, juniper.
-      when: declared_vendor not in ['cisco', 'brocade', 'juniper']
-
-    - name: "PHASE 0f: Enforce vendor-command syntax safety check"
-      fail:
-        msg: >-
-          CRITICAL ERROR: Command payload mismatch!
-          commands.txt declares vendor='{{ declared_vendor }}' but contains
-          syntax that does not match this hardware family. Execution halted.
-      when: >
-        (declared_vendor == 'juniper' and ('configure terminal' in pre_validate_commands or 'show ip interface brief' in pre_validate_commands)) or
-        (declared_vendor == 'cisco'   and ('set system' in pre_validate_commands or 'commit' in pre_validate_commands)) or
-        (declared_vendor == 'brocade' and ('write memory' in pre_validate_commands and 'configure terminal' not in pre_validate_commands))
-
-    # ------------------------------------------------------------------
-    # PHASE 1: Initialize environment and load input files
-    # ------------------------------------------------------------------
-    - name: "PHASE 1a: Pin report timestamp once for the entire run"
-      set_fact:
-        report_timestamp:       "{{ now(fmt='%Y%m%d_%H%M%S') }}"
-        report_timestamp_human: "{{ now(fmt='%Y-%m-%d %H:%M:%S') }}"
-
-    - name: "PHASE 1b: Ensure output directory exists"
+    - name: "Ensure output directory exists"
       file:
         path: "{{ output_dir }}"
         state: directory
         mode: '0755'
 
-    - name: "PHASE 1c: Read targets file"
-      set_fact:
-        device_list: >-
-          {{ lookup('file', targets_file).splitlines()
-             | reject('match', '^\s*#')
-             | reject('equalto', '')
-             | list
-             | unique }}
+    - name: "Dynamically build inventory from targets.txt"
+      add_host:
+        name: "{{ item }}"
+        groups: dynamic_targets
+      loop: "{{ lookup('file', targets_file).splitlines() | reject('match', '^\\s*#') | reject('equalto', '') | list | unique }}"
 
-    - name: "PHASE 1d: Strip vendor header and write clean commands to temp file"
-      # Strip the ## vendor: line so it is never sent to the device
-      copy:
-        dest: "/tmp/ansible_cmd_payload_{{ ansible_pid }}.txt"
-        content: >-
-          {{
-            pre_validate_commands.splitlines()
-            | reject('match', '^\s*##\s*vendor\s*:')
-            | list
-            | join('\n')
-          }}
-        mode: '0600'
-
-    # ------------------------------------------------------------------
-    # PHASE 2: SESSION 1 — Vendor fingerprint per device
-    # ------------------------------------------------------------------
-    # Runs show version (or Juniper equivalent) and captures output.
-    # No config commands are sent. Clean exit after output is received.
-    # Fingerprint keywords per vendor:
-    #   cisco   — "Cisco IOS", "IOS-XE", "catalyst", "WS-"
-    #   brocade — "IronWare", "Brocade", "FastIron", "NetIron", "HW: Stackable"
-    #   juniper — "Junos:", "JUNOS", "Model: ex", "Model: qfx", "Model: mx"
-
-    - name: "PHASE 2: SSH fingerprint session — detect vendor from show version"
-      shell: |
-        (
-          sleep 1
-          {% if declared_vendor == 'juniper' %}
-          echo "set cli screen-length 0"
-          sleep 1
-          echo "show version | no-more"
-          {% else %}
-          echo "terminal length 0"
-          sleep 1
-          echo "show version"
-          {% endif %}
-          sleep 4
-          echo "exit"
-        ) | sshpass -p '{{ ssh_password }}' ssh -tt \
-              -o PreferredAuthentications=password \
-              -o PubkeyAuthentication=no \
-              -o StrictHostKeyChecking=no \
-              -o ConnectTimeout={{ ssh_timeout }} \
-              {% if declared_vendor == 'brocade' %}
-              -o KexAlgorithms=+diffie-hellman-group1-sha1 \
-              -o HostKeyAlgorithms=+ssh-dss \
-              -o PubkeyAcceptedKeyTypes=+ssh-dss \
-              -c aes256-cbc \
-              {% endif %}
-              {{ ssh_user }}@{{ target }} 2>/dev/null || true
-      args:
-        executable: /bin/bash
-      register: fingerprint_results
-      failed_when: false
+    - name: "Extract vendor from commands.txt header"
+      shell: grep -iE '^\s*##\s*vendor\s*:' "{{ commands_file }}" | head -1 | sed 's/.*vendor\s*:\s*//I' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'
+      register: vendor_extract
       changed_when: false
-      loop: "{{ device_list }}"
-      loop_control:
-        loop_var: target
-        label: "{{ target }}"
 
-    # ------------------------------------------------------------------
-    # PHASE 2b: Evaluate fingerprint results — build pass/fail/mismatch lists
-    # ------------------------------------------------------------------
-    - name: "PHASE 2b: Classify each device from fingerprint output"
+    - name: "Set declared_vendor fact"
       set_fact:
-        # UNREACHABLE — empty output or SSH error keywords
-        fingerprint_unreachable: >-
-          {{
-            (fingerprint_results.results
-             | selectattr('stdout', 'defined')
-             | selectattr('stdout', 'search',
-                 '(?i)(connect to host|connection timed out|connection refused|'
-                 'no route to host|permission denied|network is unreachable)')
-             | map(attribute='target') | list
-             + fingerprint_results.results
-             | selectattr('stdout', 'defined')
-             | selectattr('stdout', 'equalto', '')
-             | map(attribute='target') | list)
-            | unique
-          }}
+        declared_vendor: "{{ vendor_extract.stdout }}"
 
-        # VENDOR MATCH — output contains keywords for the declared vendor
-        fingerprint_matched: >-
-          {{
-            fingerprint_results.results
-            | selectattr('stdout', 'defined')
-            | selectattr('stdout', 'search',
-                'Cisco IOS|IOS-XE|catalyst|WS-'      if declared_vendor == 'cisco'   else
-                'IronWare|Brocade|FastIron|NetIron|HW: Stackable' if declared_vendor == 'brocade' else
-                'Junos:|JUNOS'                        if declared_vendor == 'juniper' else
-                'NOMATCH', ignorecase=True)
-            | map(attribute='target') | list | unique
-          }}
+    - name: "Fail if vendor tag missing or unsupported"
+      fail:
+        msg: "CRITICAL ERROR: Unsupported or missing vendor tag in commands.txt."
+      when: declared_vendor not in ['cisco', 'juniper', 'brocade']
 
-    - name: "PHASE 2c: Derive mismatch list — reachable but wrong vendor"
+    - name: "Strip vendor header from commands.txt and write clean payload to disk"
+      shell: grep -vE '^\s*##\s*vendor\s*:' "{{ commands_file }}" > /tmp/ansible_clean_payload.txt
+      changed_when: false
+
+    - name: "Persist prompt credentials for subsequent plays"
       set_fact:
-        # MISMATCH — got output but vendor keywords not found and not unreachable
-        fingerprint_mismatch: >-
-          {{
-            device_list
-            | difference(fingerprint_matched)
-            | difference(fingerprint_unreachable)
-          }}
+        ssh_user: "{{ ssh_user }}"
+        ssh_password: "{{ ssh_password }}"
 
-    - name: "PHASE 2d: Log mismatch warning per device"
-      debug:
-        msg: >-
-          WARNING: {{ item }} responded but does not appear to be a
-          {{ declared_vendor }} device. Skipping — no commands sent.
-      loop: "{{ fingerprint_mismatch }}"
 
-    # ------------------------------------------------------------------
-    # PHASE 3: SESSION 2 — Execute payload on verified devices only
-    # ------------------------------------------------------------------
-    - name: "PHASE 3: SSH into verified device and push commands"
+- name: "PHASE 2: Parallel Execution Engine"
+  hosts: dynamic_targets
+  gather_facts: false
+  serial: 20
+  vars:
+    output_dir: "./logs"
+    ssh_timeout: 8
+    ssh_cmd_wait: 20
+
+  tasks:
+    - name: "Stage clean payload locally per target"
+      copy:
+        src: "/tmp/ansible_clean_payload.txt"
+        dest: "/tmp/payload_{{ inventory_hostname }}.txt"
+      delegate_to: localhost
+
+    - name: "Execute Payload"
       shell: |
-        set -e
-        LOG_TMP=$(mktemp /tmp/ansible_log_XXXXXX)
-        trap 'rm -f "$LOG_TMP"' EXIT
+        TARGET="{{ inventory_hostname }}"
+        SSH_PASS="{{ hostvars['localhost']['ssh_password'] }}"
+        SSH_USER="{{ hostvars['localhost']['ssh_user'] }}"
+        OUTPUT_DIR="{{ output_dir }}"
+        PAYLOAD="/tmp/payload_${TARGET}.txt"
 
-        (
-          sleep 1
-          {% if declared_vendor == 'cisco' %}
-          echo "terminal length 0" 2>/dev/null || true
-          {% elif declared_vendor == 'juniper' %}
-          echo "cli"               2>/dev/null || true
-          {% endif %}
-          sleep 1
-          cat "/tmp/ansible_cmd_payload_{{ ansible_pid }}.txt"
-          sleep {{ ssh_cmd_wait }}
-          echo "exit"
-        ) | sshpass -p '{{ ssh_password }}' ssh -tt \
-              -o PreferredAuthentications=password \
-              -o PubkeyAuthentication=no \
-              -o StrictHostKeyChecking=no \
-              -o ConnectTimeout={{ ssh_timeout }} \
-              {% if declared_vendor == 'brocade' %}
-              -o KexAlgorithms=+diffie-hellman-group1-sha1 \
-              -o HostKeyAlgorithms=+ssh-dss \
-              -o PubkeyAcceptedKeyTypes=+ssh-dss \
-              -c aes256-cbc \
-              {% endif %}
-              {{ ssh_user }}@{{ target }} > "$LOG_TMP" 2>&1 || true
+        SSH_OPTS="-o PreferredAuthentications=password \
+                  -o PubkeyAuthentication=no \
+                  -o StrictHostKeyChecking=no \
+                  -o ConnectTimeout={{ ssh_timeout }} \
+                  -o ServerAliveInterval=5 \
+                  -o ServerAliveCountMax=2"
 
-        # --- Juniper-specific commit-failure detection & auto-rollback ---
-        {% if declared_vendor == 'juniper' %}
-        if grep -qiE "error:.*commit|commit.*failed|check-out failed" "$LOG_TMP"; then
-          (
-            sleep 1
-            echo "cli"       2>/dev/null || true
-            sleep 1
-            echo "configure"
-            sleep 1
-            echo "rollback 0"
-            sleep 1
-            echo "exit"
-            sleep 1
-            echo "exit"
-          ) | sshpass -p '{{ ssh_password }}' ssh -tt \
-                -o PreferredAuthentications=password \
-                -o PubkeyAuthentication=no \
-                -o StrictHostKeyChecking=no \
-                -o ConnectTimeout={{ ssh_timeout }} \
-                {{ ssh_user }}@{{ target }} > /dev/null 2>&1 || true
+        LOG_TMP=$(mktemp /tmp/ansible_run_XXXXXX)
+        VENDOR="{{ hostvars['localhost']['declared_vendor'] }}"
 
-          echo -e "\n\n!!! AUTOMATED AUDIT ALERT: COMMIT FAILED — ROLLBACK 0 EXECUTED !!!" >> "$LOG_TMP"
+        if [ "$VENDOR" = "cisco" ] || [ "$VENDOR" = "brocade" ]; then
+          # --- CISCO / BROCADE: no commit, send payload as-is ---
+          # Brief sleep at start lets the device finish its banner before commands arrive
+          timeout {{ ssh_cmd_wait }} bash -c \
+            "(sleep 5; cat '$PAYLOAD') | sshpass -p '$SSH_PASS' ssh -tt $SSH_OPTS ${SSH_USER}@${TARGET}" \
+            > "$LOG_TMP" 2>&1 || true
+
+          if [ -z "$(cat $LOG_TMP)" ] || grep -qiE '(connect to host|connection timed out|connection refused|no route to host|permission denied)' "$LOG_TMP"; then
+            { echo "STATUS:UNREACHABLE"; cat "$LOG_TMP"; } > "${OUTPUT_DIR}/${TARGET}_execution.log"
+            rm -f "$LOG_TMP"
+            echo "STATUS:UNREACHABLE"
+            exit 0
+          fi
+
+
+          # Validate commands actually ran — must see a config prompt in output
+          if ! grep -qE "\(config" "$LOG_TMP"; then
+            { echo "STATUS:NO_COMMANDS_EXECUTED"; cat "$LOG_TMP"; } > "${OUTPUT_DIR}/${TARGET}_execution.log"
+            rm -f "$LOG_TMP"
+            echo "STATUS:NO_COMMANDS_EXECUTED"
+            exit 0
+          fi
+
+          { echo "STATUS:SUCCESS"; cat "$LOG_TMP"; } > "${OUTPUT_DIR}/${TARGET}_execution.log"
+          rm -f "$LOG_TMP"
+          echo "STATUS:SUCCESS"
+          exit 0
         fi
-        {% endif %}
 
-        cat "$LOG_TMP"
+        # --- JUNIPER: strip exit lines, send up to commit, check result ---
+        STRIPPED=$(mktemp /tmp/ansible_stripped_XXXXXX)
+        grep -vE '^exit$' "$PAYLOAD" > "$STRIPPED"
+
+        timeout {{ ssh_cmd_wait }} bash -c \
+          "(cat '$STRIPPED'; sleep 2) | sshpass -p '$SSH_PASS' ssh -tt $SSH_OPTS ${SSH_USER}@${TARGET}" \
+          > "$LOG_TMP" 2>&1 || true
+
+        rm -f "$STRIPPED"
+
+        # Check unreachable
+        if [ -z "$(cat $LOG_TMP)" ] || grep -qiE '(connect to host|connection timed out|connection refused|no route to host|permission denied)' "$LOG_TMP"; then
+          { echo "STATUS:UNREACHABLE"; cat "$LOG_TMP"; } > "${OUTPUT_DIR}/${TARGET}_execution.log"
+          rm -f "$LOG_TMP"
+          echo "STATUS:UNREACHABLE"
+          exit 0
+        fi
+
+        # Check for pre-existing candidate config
+        if grep -q "The configuration has been changed but not committed" "$LOG_TMP"; then
+          timeout 10 bash -c \
+            "(printf '%s\n' 'exit' 'exit'; sleep 1) | sshpass -p '$SSH_PASS' ssh -tt $SSH_OPTS ${SSH_USER}@${TARGET}" \
+            >> "$LOG_TMP" 2>&1 || true
+          { echo "STATUS:CANDIDATE_CONFIG_PRESENT"; cat "$LOG_TMP"; } > "${OUTPUT_DIR}/${TARGET}_execution.log"
+          rm -f "$LOG_TMP"
+          echo "STATUS:CANDIDATE_CONFIG_PRESENT"
+          exit 0
+        fi
+
+        # Check for commit failure — rollback then exit
+        if grep -q "error: configuration check-out failed" "$LOG_TMP"; then
+          timeout 20 bash -c \
+            "(printf '%s\n' 'edit' 'rollback 0' 'exit' 'exit'; sleep 2) | sshpass -p '$SSH_PASS' ssh -tt $SSH_OPTS ${SSH_USER}@${TARGET}" \
+            >> "$LOG_TMP" 2>&1 || true
+          { echo "STATUS:COMMIT_FAILURE"; cat "$LOG_TMP"; } > "${OUTPUT_DIR}/${TARGET}_execution.log"
+          rm -f "$LOG_TMP"
+          echo "STATUS:COMMIT_FAILURE"
+          exit 0
+        fi
+
+        # Commit succeeded — exit config mode and SSH cleanly
+        timeout 10 bash -c \
+          "(printf '%s\n' 'exit' 'exit'; sleep 1) | sshpass -p '$SSH_PASS' ssh -tt $SSH_OPTS ${SSH_USER}@${TARGET}" \
+          >> "$LOG_TMP" 2>&1 || true
+
+        { echo "STATUS:SUCCESS"; cat "$LOG_TMP"; } > "${OUTPUT_DIR}/${TARGET}_execution.log"
+        rm -f "$LOG_TMP"
+        echo "STATUS:SUCCESS"
       args:
         executable: /bin/bash
-      register: device_execution
-      failed_when: false
-      changed_when: false
-      loop: "{{ fingerprint_matched }}"
-      loop_control:
-        loop_var: target
-        label: "{{ target }}"
+      register: exec_result
+      delegate_to: localhost
+      async: 90
+      poll: 5
 
-    # ------------------------------------------------------------------
-    # PHASE 4: Write per-device log files
-    # ------------------------------------------------------------------
-    - name: "PHASE 4a: Log output for each executed device"
-      copy:
-        dest: "{{ output_dir }}/{{ item.target }}_verification.log"
-        content: |
-          ======================================================================
-          COMMAND EXECUTION RECORD
-          Target Device : {{ item.target }}
-          Execution Time: {{ report_timestamp_human }}
-          Vendor Profile: {{ declared_vendor }}
-          ======================================================================
-
-          {{ item.stdout | default('NO OUTPUT GENERATED OR DEVICE UNREACHABLE') }}
-        mode: '0644'
-      loop: "{{ device_execution.results }}"
-      loop_control:
-        label: "{{ item.target }}"
-
-    - name: "PHASE 4b: Log skipped mismatch devices"
-      copy:
-        dest: "{{ output_dir }}/{{ item }}_SKIPPED_vendor_mismatch.log"
-        content: |
-          ======================================================================
-          DEVICE SKIPPED — VENDOR MISMATCH
-          Target Device  : {{ item }}
-          Execution Time : {{ report_timestamp_human }}
-          Declared Vendor: {{ declared_vendor }}
-          ======================================================================
-
-          This device responded to SSH but its show version output did not
-          contain fingerprint keywords for {{ declared_vendor }}.
-          No commands were sent. Manual verification required.
-        mode: '0644'
-      loop: "{{ fingerprint_mismatch }}"
-
-    # ------------------------------------------------------------------
-    # PHASE 5: Cleanup temp payload file
-    # ------------------------------------------------------------------
-    - name: "PHASE 5: Remove temp command payload"
+    - name: "Remove staged local payload"
       file:
-        path: "/tmp/ansible_cmd_payload_{{ ansible_pid }}.txt"
+        path: "/tmp/payload_{{ inventory_hostname }}.txt"
         state: absent
+      delegate_to: localhost
 
-    # ------------------------------------------------------------------
-    # PHASE 6: Generate change window summary report
-    # ------------------------------------------------------------------
-    - name: "PHASE 6a: Build raw rollback and unreachable candidate lists"
-      set_fact:
-        _raw_rollback: >-
-          {{ device_execution.results
-             | selectattr('stdout', 'defined')
-             | selectattr('stdout', 'search', 'AUTOMATED AUDIT ALERT')
-             | map(attribute='target')
-             | list | unique }}
 
-        _raw_unreachable: >-
-          {{ (device_execution.results
-             | selectattr('stdout', 'defined')
-             | selectattr('stdout', 'search',
-                 '(?i)(connect to host|connection timed out|connection refused|'
-                 'no route to host|permission denied|host key verification|'
-                 'network is unreachable|ssh_exchange_identification|'
-                 'Operation timed out)')
-             | map(attribute='target') | list
-             + device_execution.results
-             | selectattr('stdout', 'defined')
-             | selectattr('stdout', 'equalto', '')
-             | map(attribute='target') | list
-             + device_execution.results
-             | rejectattr('stdout', 'defined')
-             | map(attribute='target') | list)
-             | unique }}
+- name: "PHASE 3: Consolidated Summary Report"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    output_dir: "./logs"
+  tasks:
+    - name: "Read status from each host log file"
+      shell: head -1 "{{ output_dir }}/{{ item }}_execution.log" 2>/dev/null || echo "STATUS:UNKNOWN"
+      loop: "{{ groups['dynamic_targets'] }}"
+      register: host_statuses
+      changed_when: false
 
-    - name: "PHASE 6b: Apply strict set subtraction — mutually exclusive buckets"
-      set_fact:
-        summary_rollback:    "{{ _raw_rollback }}"
-        summary_unreachable: "{{ (_raw_unreachable + fingerprint_unreachable) | unique | difference(_raw_rollback) }}"
-        summary_mismatch:    "{{ fingerprint_mismatch }}"
-        summary_success: >-
-          {{ fingerprint_matched
-             | difference(_raw_rollback)
-             | difference(_raw_unreachable) }}
-
-    - name: "PHASE 6c: Write summary report"
+    - name: "Generate Summary Structure"
       copy:
-        dest: "{{ output_dir }}/SUMMARY_{{ report_timestamp }}.txt"
+        dest: "{{ output_dir }}/SUMMARY_{{ now(fmt='%Y%m%d_%H%M%S') }}.txt"
         content: |
           ======================================================================
-          CHANGE WINDOW SUMMARY
+          CHANGE WINDOW SUMMARY REPORT
           ======================================================================
-          Executed    : {{ report_timestamp_human }}
-          Vendor      : {{ declared_vendor }}
-          Commands    : {{ commands_file }}
-          Targets     : {{ targets_file }}
+          Executed: {{ now(fmt='%Y-%m-%d %H:%M:%S') }}
 
-          TOTALS
-          ------
-          Total Targets   : {{ device_list | length }}
-          Vendor Matched  : {{ fingerprint_matched | length }}
-          Vendor Mismatch : {{ summary_mismatch | length }}{% if summary_mismatch | length > 0 %}  ← skipped, no commands sent{% endif %}
-
-          Reachable       : {{ (summary_success | length) + (summary_rollback | length) }}
-          Unreachable     : {{ summary_unreachable | length }}
-          Commit Failures : {{ summary_rollback | length }}{% if summary_rollback | length > 0 %}  ← rollback executed on all{% endif %}
-
-          Clean Success   : {{ summary_success | length }}
-
-          {% if summary_mismatch | length > 0 %}
-          ======================================================================
-          VENDOR MISMATCH — SKIPPED (manual verification required)
-          ======================================================================
-          {% for ip in summary_mismatch %}
-            {{ ip }}
+          RESULTS BREAKDOWN:
+          ----------------------------------------------------------------------
+          {% for result in host_statuses.results %}
+          {{ result.item }} : {{ result.stdout | trim }}
           {% endfor %}
-
-          {% endif %}
-          {% if summary_unreachable | length > 0 %}
-          ======================================================================
-          UNREACHABLE DEVICES (manual follow-up required)
-          ======================================================================
-          {% for ip in summary_unreachable %}
-            {{ ip }}
-          {% endfor %}
-
-          {% endif %}
-          {% if summary_rollback | length > 0 %}
-          ======================================================================
-          COMMIT FAILURES — ROLLBACK 0 EXECUTED (verify manually)
-          ======================================================================
-          {% for ip in summary_rollback %}
-            {{ ip }}
-          {% endfor %}
-
-          {% endif %}
-          ======================================================================
-          CLEAN SUCCESS
-          ======================================================================
-          {% for ip in summary_success %}
-            {{ ip }}
-          {% endfor %}
-        mode: '0644'
-
-    - name: "PHASE 6d: Print summary to terminal"
-      debug:
-        msg: |
-          ======================================================================
-          RUN COMPLETE — {{ device_list | length }} targets processed
-          Vendor Matched  : {{ fingerprint_matched | length }}
-          Vendor Mismatch : {{ summary_mismatch | length }}
-          Clean Success   : {{ summary_success | length }}
-          Unreachable     : {{ summary_unreachable | length }}
-          Commit Failures : {{ summary_rollback | length }}
-          Full report written to: {{ output_dir }}/SUMMARY_{{ report_timestamp }}.txt
           ======================================================================
